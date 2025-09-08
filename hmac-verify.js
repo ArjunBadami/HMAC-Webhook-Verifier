@@ -43,24 +43,43 @@ function verifyGitHubSignature({ secret, payload, signatureHeader }) {
 }
 
 /**
+ * Parse Stripe header.
+ * - Header: "Stripe-Signature: t=<unix>,v1=<hexdigest>[,v0=...,v1=...]"
+ * - Returns { t, v1s } where v1s is an array of all v1 signature hex strings.
+ */
+function parseStripeHeader(headerValue) {
+  if (!headerValue) return null;
+
+  // Split by commas into key=value pairs, but only on the first '=' per pair.
+  const kvs = String(headerValue)
+    .split(",")
+    .map((kv) => {
+      const [k, ...rest] = kv.split("=");
+      return [k.trim(), rest.join("=").trim()];
+    });
+
+  // Collect non-v1 entries into 'parts' and all v1 values into 'v1s'
+  const parts = Object.fromEntries(kvs.filter(([k]) => k !== "v1"));
+  const v1s = kvs
+    .filter(([k]) => k === "v1")
+    .map(([, v]) => v)
+    .filter(Boolean);
+
+  if (!parts.t || v1s.length === 0) return null;
+
+  const t = Number(parts.t);
+  if (!Number.isFinite(t)) return null;
+
+  return { t, v1s };
+}
+
+/**
  * Verify a Stripe-style webhook.
  * - Header: "Stripe-Signature: t=<unix>,v1=<hexdigest>[,v0=...,v1=...]"
  * - Signed payload is: `${t}.${rawBody}`
  * - Reject if timestamp is too old (default 5 min).
+ * - Accept if ANY provided v1 matches (Stripe can send multiple).
  */
-function parseStripeHeader(headerValue) {
-  if (!headerValue) return null;
-  const parts = Object.fromEntries(
-    String(headerValue)
-      .split(",")
-      .map((kv) => kv.split("=").map((s) => s.trim()))
-  );
-  if (!parts.t || !parts.v1) return null;
-  const t = Number(parts.t);
-  if (!Number.isFinite(t)) return null;
-  return { t, v1: parts.v1 };
-}
-
 function verifyStripeSignature({
   secret,
   payload,
@@ -75,13 +94,19 @@ function verifyStripeSignature({
   const skew = Math.abs(nowSec() - parsed.t);
   if (skew > toleranceSec) return false;
 
-  const signed = `${parsed.t}.${Buffer.isBuffer(payload) ? payload.toString("utf8") : String(payload)}`;
-  return verifyHmac({
-    algo: "sha256",
-    secret,
-    payload: signed,
-    expected: parsed.v1,
-  });
+  const signed = `${parsed.t}.${
+    Buffer.isBuffer(payload) ? payload.toString("utf8") : String(payload)
+  }`;
+
+  // Accept if ANY v1 matches
+  return parsed.v1s.some((v1) =>
+    verifyHmac({
+      algo: "sha256",
+      secret,
+      payload: signed,
+      expected: v1,
+    })
+  );
 }
 
 module.exports = {
